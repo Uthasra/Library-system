@@ -110,11 +110,30 @@ const router = Router();
  */
 router.get('/', async (req, res, next) => {
   try {
-    // TODO: your code goes here.
-    res.status(501).json({ error: 'GET /api/books is not built yet.' });
+    const PAGE_SIZE = 12;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const offset = (page - 1) * PAGE_SIZE;
+
+    const items = await query(
+      `SELECT
+         b.id, b.isbn, b.title, b.author, b.publisher, b.year,
+         b.dewey, b.category, b.shelf,
+         b.added_at AS addedAt,
+         COUNT(c.id) AS totalCopies,
+         COUNT(CASE WHEN c.status = 'available' THEN 1 END) AS availableCopies
+       FROM books b
+       LEFT JOIN copies c ON c.book_id = b.id
+       GROUP BY b.id
+       ORDER BY b.title
+       LIMIT ${PAGE_SIZE} OFFSET ${offset}`
+    );
+
+    const [{ total }] = await query('SELECT COUNT(*) AS total FROM books');
+    
+  
+
+    res.json({ items, total, page, pageSize: PAGE_SIZE });
   } catch (err) {
-    // Passing the error on means the handler in app.js deals with it, instead
-    // of the request hanging until it times out.
     next(err);
   }
 });

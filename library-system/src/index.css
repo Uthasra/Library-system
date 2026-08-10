@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Design tokens.
+
+   The palette is cool and civic rather than warm and antique: a librarian at a
+   circulation desk works in a signage-and-wayfinding environment, not a
+   Victorian reading room. The classification colours below are the real system
+   -- they encode Dewey ranges, the way coloured spine tape does on a shelf.
+   --------------------------------------------------------------------------- */
+@theme {
+  --color-ink-50:  #F2F4F8;
+  --color-ink-100: #E4E8F0;
+  --color-ink-200: #C8D0E0;
+  --color-ink-300: #93A0BC;
+  --color-ink-400: #5C6B8A;
+  --color-ink-500: #35456A;
+  --color-ink-600: #22315480;
+  --color-ink-700: #1B2949;
+  --color-ink-800: #14213D;
+  --color-ink-900: #0D1628;
+
+  --color-paper:  #F7F8FA;
+  --color-shelf:  #E8EBF0;
+
+  /* Status. Used sparingly and always meaning the same thing. */
+  --color-due-ok:      #0F766E;  /* on shelf, returned, healthy */
+  --color-due-soon:    #B45309;  /* due within three days */
+  --color-due-late:    #C2262B;  /* overdue -- the only red in the app */
+  --color-due-hold:    #6D28D9;  /* reserved */
+
+  /* Dewey classification colours. These are the spine-label system. */
+  --color-dewey-000: #64748B;
+  --color-dewey-100: #7C3AED;
+  --color-dewey-200: #2563EB;
+  --color-dewey-300: #0891B2;
+  --color-dewey-400: #059669;
+  --color-dewey-500: #65A30D;
+  --color-dewey-600: #CA8A04;
+  --color-dewey-700: #EA580C;
+  --color-dewey-800: #DB2777;
+  --color-dewey-900: #9333EA;
+
+  --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+@layer base {
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink-800);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+
+  /* Identifiers -- call numbers, ISBNs, barcodes, member numbers -- are always
+     monospaced with tabular figures so they line up down a column. */
+  .data {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  *:focus-visible {
+    outline: 2px solid var(--color-ink-800);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  ::selection { background: var(--color-ink-200); }
+}
+
+@layer components {
+  /* The signature element: a spine label. Vertical rule in the classification
+     colour, call number in mono -- the same object a librarian reads off a
+     shelf, reused as the identifier chip throughout the interface. */
+  .spine {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.15rem 0.45rem 0.15rem 0.35rem;
+    border-radius: 3px;
+    background: #fff;
+    border: 1px solid var(--color-shelf);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+  }
+  .spine::before {
+    content: "";
+    width: 3px;
+    align-self: stretch;
+    border-radius: 2px;
+    background: var(--spine-color, var(--color-dewey-000));
+  }
+}
+
+@media print {
+  .no-print { display: none !important; }
+  body { background: #fff; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
