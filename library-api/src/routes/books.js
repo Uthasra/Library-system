@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { query } from '../db.js';
+import { query, queryOne } from '../db.js';
 
 const router = Router();
 
@@ -8,111 +8,51 @@ const router = Router();
  *
  *     app.use('/api/books', booksRouter)
  *
- * every path in here is relative to /api/books. So router.get('/') below
- * answers GET /api/books, and router.get('/:id') would answer
- * GET /api/books/42.
+ * every path in here is relative to /api/books. So router.get('/') answers
+ * GET /api/books, and router.get('/:id') answers GET /api/books/42.
  */
 
+const PAGE_SIZE = 12;
+
 /* ===========================================================================
- *  YOUR TASK — Endpoint 1 of 22:  GET /api/books
+ *  GET /api/books      —  the catalogue, filtered and paged
  * ===========================================================================
  *
- * Return the catalogue, in this exact shape:
- *
- *   {
- *     "items": [ { id, isbn, title, author, publisher, year, dewey,
- *                  category, shelf, totalCopies, availableCopies } ],
- *     "total": 26,
- *     "page": 1,
- *     "pageSize": 12
- *   }
- *
- * Build it in three passes. Get each one working before starting the next.
- *
- * ---------------------------------------------------------------------------
- * PASS 1 — return every book, no counts, no filters
- * ---------------------------------------------------------------------------
- * Write a SELECT over `books`, and send it back as { items, total, page,
- * pageSize }. Hard-code page 1 and pageSize 12 for now.
- *
- * Careful: the database column is `added_at`, but the frontend expects
- * `addedAt`. Rename columns in SQL with AS:
- *
- *     SELECT added_at AS addedAt FROM books
- *
- * MySQL keeps the capitals in an alias, so no quoting is needed. (In
- * PostgreSQL you would have to write "addedAt" in double quotes.)
- *
- * ---------------------------------------------------------------------------
- * PASS 2 — add totalCopies and availableCopies
- * ---------------------------------------------------------------------------
- * These are not columns on `books`. They are counted from `copies`.
- *
- * You need a LEFT JOIN onto copies, then GROUP BY b.id. Two hints:
- *
- *   - COUNT(c.id) counts the copies. Use COUNT(c.id), not COUNT(*), or a book
- *     with no copies will come back as 1 instead of 0.
- *   - To count only the available ones, use a conditional count:
- *
- *         COUNT(CASE WHEN c.status = 'available' THEN 1 END)
- *
- *     COUNT ignores NULLs, so rows that fail the condition are not counted.
- *     (PostgreSQL has a neater FILTER clause for this; MySQL does not.)
- *
- * ---------------------------------------------------------------------------
- * PASS 3 — filters and paging
- * ---------------------------------------------------------------------------
- * Read from req.query:
- *
- *   search        matches title, author, isbn or dewey. Use LIKE with %
- *                 around the term. MySQL's default collation is already
- *                 case-insensitive, so LIKE 'clean%' finds "Clean Code".
- *   category      exact match
- *   availability  'available' → availableCopies > 0
- *                 'out'       → availableCopies = 0
- *   page          which page, default 1
- *
- * Two things that catch people out:
- *
- *   1. `total` must be the number of books MATCHING THE FILTERS, not the
- *      number on this page. Otherwise the pager shows the wrong page count.
- *      This usually means a second COUNT query.
- *
- *   2. `availability` filters on an aggregate, so it belongs in HAVING, not
- *      WHERE. WHERE runs before rows are grouped; HAVING runs after.
- *
- * Build the parameter list as you go, in the same order as the ? marks:
- *
- *     const params = [];
- *     const where = [];
- *     if (search) {
- *       params.push(`%${search}%`);
- *       where.push('(b.title LIKE ? OR b.author LIKE ? ...)');
- *     }
- *
- * MySQL uses ? for every value, so ORDER MATTERS: the first ? takes the first
- * item in the array. If a condition needs the search term four times, push it
- * four times.
- *
- * One catch: pool.execute() does not accept ? for LIMIT and OFFSET in some
- * MySQL versions. If you hit that, use pool.query() for this one, or put the
- * numbers straight into the string AFTER checking they are integers:
- *
- *     const limit = 12;
- *     const offset = (Number(page) - 1) * limit;   // never a raw string
- *
- * ---------------------------------------------------------------------------
- * Test it as you go:
- *     curl "http://localhost:4000/api/books"
- *     curl "http://localhost:4000/api/books?search=clean"
- *     curl "http://localhost:4000/api/books?availability=out&page=2"
- * ===========================================================================
+ * The pattern below is worth learning properly, because every list endpoint in
+ * this project uses it: build the WHERE and HAVING pieces in arrays, push each
+ * value onto `params` in the same order, then glue it together at the end.
  */
 router.get('/', async (req, res, next) => {
   try {
-    const PAGE_SIZE = 12;
+    const { search, category, availability } = req.query;
     const page = Math.max(1, Number(req.query.page) || 1);
     const offset = (page - 1) * PAGE_SIZE;
+
+    const where = [];
+    const having = [];
+    const params = [];
+
+    // Filters that look at columns on `books` go in WHERE.
+    if (search) {
+      // One term, four columns, so the value is pushed four times -- MySQL's
+      // ? does not repeat the way PostgreSQL's $1 does.
+      const term = `%${search}%`;
+      where.push('(b.title LIKE ? OR b.author LIKE ? OR b.isbn LIKE ? OR b.dewey LIKE ?)');
+      params.push(term, term, term, term);
+    }
+
+    if (category) {
+      where.push('b.category = ?');
+      params.push(category);
+    }
+
+    // `availability` looks at a COUNT, which does not exist until the rows
+    // have been grouped -- so it belongs in HAVING, not WHERE.
+    if (availability === 'available') having.push('availableCopies > 0');
+    if (availability === 'out') having.push('availableCopies = 0');
+
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const havingSql = having.length ? `HAVING ${having.join(' AND ')}` : '';
 
     const items = await query(
       `SELECT
@@ -123,16 +63,124 @@ router.get('/', async (req, res, next) => {
          COUNT(CASE WHEN c.status = 'available' THEN 1 END) AS availableCopies
        FROM books b
        LEFT JOIN copies c ON c.book_id = b.id
+       ${whereSql}
        GROUP BY b.id
+       ${havingSql}
        ORDER BY b.title
-       LIMIT ${PAGE_SIZE} OFFSET ${offset}`
+       LIMIT ${PAGE_SIZE} OFFSET ${offset}`,
+      params
     );
 
-    const [{ total }] = await query('SELECT COUNT(*) AS total FROM books');
-    
-  
+    /**
+     * `total` has to be the number of books MATCHING THE FILTERS -- not the 26
+     * in the table, and not the 12 on this page -- otherwise the pager shows
+     * the wrong number of pages.
+     *
+     * Because HAVING filters a grouped result, counting means grouping first
+     * and then counting the groups. That is what the subquery does: the inner
+     * query produces one row per matching book, the outer one counts them.
+     */
+    const totalRow = await queryOne(
+      `SELECT COUNT(*) AS total FROM (
+         SELECT b.id,
+                COUNT(CASE WHEN c.status = 'available' THEN 1 END) AS availableCopies
+         FROM books b
+         LEFT JOIN copies c ON c.book_id = b.id
+         ${whereSql}
+         GROUP BY b.id
+         ${havingSql}
+       ) AS matched`,
+      params
+    );
 
-    res.json({ items, total, page, pageSize: PAGE_SIZE });
+    res.json({ items, total: totalRow.total, page, pageSize: PAGE_SIZE });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ===========================================================================
+ *  GET /api/books/:id  —  one book, with its physical copies
+ * ===========================================================================
+ *
+ * Two queries rather than one. Joining copies onto the book would repeat every
+ * book column once per copy, and you would have to stitch the rows back
+ * together in JavaScript anyway. Fetching the book, then its copies, is
+ * clearer and no slower at this size.
+ */
+router.get('/:id', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+
+    // The path is a string, so anything could arrive here. Reject nonsense
+    // before it reaches the database.
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({ error: 'The book id must be a whole number.' });
+    }
+
+    const book = await queryOne(
+      `SELECT
+         b.id, b.isbn, b.title, b.author, b.publisher, b.year,
+         b.dewey, b.category, b.shelf, b.description,
+         b.added_at AS addedAt,
+         COUNT(c.id) AS totalCopies,
+         COUNT(CASE WHEN c.status = 'available' THEN 1 END) AS availableCopies
+       FROM books b
+       LEFT JOIN copies c ON c.book_id = b.id
+       WHERE b.id = ?
+       GROUP BY b.id`,
+      [id]
+    );
+
+    // "Not found" is a 404, not an empty 200. The client has to be able to
+    // tell "no such book" from "a book with no data".
+    if (!book) {
+      return res.status(404).json({ error: 'No book with that id.' });
+    }
+
+    /**
+     * Each copy carries its current loan, if it has one. The join onto loans
+     * uses `l.returned_at IS NULL`, so only an OPEN loan matches -- a copy
+     * borrowed twenty times still has at most one open loan.
+     */
+    const copies = await query(
+      `SELECT
+         c.id, c.barcode, c.status, c.\`condition\`,
+         c.acquired_at AS acquiredAt,
+         l.id        AS loanId,
+         l.due_at    AS loanDueAt,
+         m.id        AS memberId,
+         m.name      AS memberName,
+         m.member_no AS memberNo
+       FROM copies c
+       LEFT JOIN loans l   ON l.copy_id = c.id AND l.returned_at IS NULL
+       LEFT JOIN members m ON m.id = l.member_id
+       WHERE c.book_id = ?
+       ORDER BY c.barcode`,
+      [id]
+    );
+
+    /**
+     * SQL gives back flat rows; the frontend wants the loan nested inside the
+     * copy. Reshaping in JavaScript is the normal way to bridge that gap.
+     */
+    book.copies = copies.map((c) => ({
+      id: c.id,
+      barcode: c.barcode,
+      status: c.status,
+      condition: c.condition,
+      acquiredAt: c.acquiredAt,
+      currentLoan: c.loanId
+        ? {
+            id: c.loanId,
+            dueAt: c.loanDueAt,
+            status: new Date(c.loanDueAt) < new Date() ? 'overdue' : 'active',
+            member: { id: c.memberId, name: c.memberName, memberNo: c.memberNo },
+          }
+        : null,
+    }));
+
+    res.json(book);
   } catch (err) {
     next(err);
   }

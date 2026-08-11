@@ -1,7 +1,10 @@
 import express from 'express';
 import cors from 'cors';
 import booksRouter from './routes/books.js';
-
+import membersRouter from './routes/members.js';
+import finesRouter from './routes/fines.js';
+import loansRouter from './routes/loans.js';
+import settingsRouter from './routes/settings.js';
 export function createApp() {
   const app = express();
 
@@ -22,7 +25,10 @@ export function createApp() {
 
   // Everything in books.js is mounted under /api/books.
   app.use('/api/books', booksRouter);
-
+  app.use('/api/members', membersRouter); 
+  app.use('/api/loans',loansRouter)
+  app.use('/api/fines',finesRouter)
+  app.use('/api/settings',settingsRouter)
   // Nothing matched above, so the path does not exist.
   app.use((req, res) => {
     res.status(404).json({ error: `No route for ${req.method} ${req.path}` });
