@@ -61,3 +61,56 @@ export async function execute(sql, params = []) {
   const [result] = await pool.execute(sql, params);
   return result.affectedRows;
 }
+
+/**
+ * Runs several statements as one all-or-nothing unit.
+ *
+ *   await transaction(async (tx) => {
+ *     const id = await tx.insert('INSERT INTO books ...', [...]);
+ *     await tx.insert('INSERT INTO copies ...', [id, ...]);
+ *   });
+ *
+ * If any statement throws, everything rolls back. Without this you can end up
+ * with a book in the catalogue and no copy to lend -- a row that looks fine
+ * but can never be borrowed.
+ *
+ * Note it takes a connection out of the pool and gives it back at the end. A
+ * transaction has to run on ONE connection: BEGIN on one and INSERT on another
+ * are two unrelated sessions.
+ */
+export async function transaction(work) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const tx = {
+      query: async (sql, params = []) => {
+        const [rows] = await conn.execute(sql, params);
+        return rows;
+      },
+      queryOne: async (sql, params = []) => {
+        const [rows] = await conn.execute(sql, params);
+        return rows[0] ?? null;
+      },
+      insert: async (sql, params = []) => {
+        const [result] = await conn.execute(sql, params);
+        return result.insertId;
+      },
+      execute: async (sql, params = []) => {
+        const [result] = await conn.execute(sql, params);
+        return result.affectedRows;
+      },
+    };
+
+    const result = await work(tx);
+    await conn.commit();
+    return result;
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    // Always hand the connection back, even after a failure. Forgetting this
+    // leaks connections until the pool is exhausted and everything hangs.
+    conn.release();
+  }
+}

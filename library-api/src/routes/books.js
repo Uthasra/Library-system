@@ -1,5 +1,6 @@
 import { Router } from 'express';
-import { query, queryOne } from '../db.js';
+import { execute, insert, query, queryOne, transaction } from '../db.js';
+import { HttpError, check, clean, isbnRule, readId, required, yearRule } from '../validate.js';
 
 const router = Router();
 
@@ -13,6 +14,44 @@ const router = Router();
  */
 
 const PAGE_SIZE = 12;
+
+/**
+ * One book with its copy counts. Written once because create, update and the
+ * detail endpoint all have to return exactly the same shape -- if they drifted
+ * apart, the form would show different numbers after saving than before.
+ */
+const BOOK_BY_ID = `
+  SELECT
+    b.id, b.isbn, b.title, b.author, b.publisher, b.year,
+    b.dewey, b.category, b.shelf, b.description,
+    b.added_at AS addedAt,
+    COUNT(c.id) AS totalCopies,
+    COUNT(CASE WHEN c.status = 'available' THEN 1 END) AS availableCopies
+  FROM books b
+  LEFT JOIN copies c ON c.book_id = b.id
+  WHERE b.id = ?
+  GROUP BY b.id
+`;
+
+/** Rejects the request unless title, author, ISBN and year all pass. */
+function validateBook(body) {
+  check({
+    title: required(body.title, 'Title'),
+    author: required(body.author, 'Author'),
+    isbn: isbnRule(body.isbn),
+    year: yearRule(body.year),
+  });
+}
+
+/** Next free barcode, e.g. C00042. Kept inside the transaction so two
+ *  simultaneous inserts cannot pick the same number. */
+async function nextBarcode(tx) {
+  const row = await tx.queryOne(
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(barcode, 2) AS UNSIGNED)), 0) + 1 AS next
+     FROM copies WHERE barcode REGEXP '^C[0-9]+$'`
+  );
+  return `C${String(row.next).padStart(5, '0')}`;
+}
 
 /* ===========================================================================
  *  GET /api/books      —  the catalogue, filtered and paged
@@ -147,11 +186,11 @@ router.get('/:id', async (req, res, next) => {
       `SELECT
          c.id, c.barcode, c.status, c.\`condition\`,
          c.acquired_at AS acquiredAt,
-         l.id        AS loanId,
-         l.due_at    AS loanDueAt,
-         m.id        AS memberId,
-         m.name      AS memberName,
-         m.member_no AS memberNo
+         l.id          AS loanId,
+         l.due_at      AS loanDueAt,
+         m.id          AS memberId,
+         m.name        AS memberName,
+         m.member_no   AS memberNo
        FROM copies c
        LEFT JOIN loans l   ON l.copy_id = c.id AND l.returned_at IS NULL
        LEFT JOIN members m ON m.id = l.member_id
@@ -181,6 +220,170 @@ router.get('/:id', async (req, res, next) => {
     }));
 
     res.json(book);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ===========================================================================
+ *  POST /api/books     —  catalogue a new title
+ * ===========================================================================
+ *
+ * Two rows have to be written: the book, and its first physical copy. A title
+ * with no copy sits in the catalogue looking normal but cannot be borrowed --
+ * so both inserts go in one transaction. Either both land or neither does.
+ */
+router.post('/', async (req, res, next) => {
+  try {
+    validateBook(req.body);
+
+    const book = await transaction(async (tx) => {
+      const bookId = await tx.insert(
+        `INSERT INTO books (isbn, title, author, publisher, year, dewey, category, shelf, description)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          clean(req.body.isbn),
+          clean(req.body.title),
+          clean(req.body.author),
+          clean(req.body.publisher),
+          req.body.year ? Number(req.body.year) : null,
+          clean(req.body.dewey),
+          clean(req.body.category),
+          clean(req.body.shelf),
+          clean(req.body.description),
+        ]
+      );
+
+      await tx.insert(
+        'INSERT INTO copies (book_id, barcode, `condition`) VALUES (?, ?, ?)',
+        [bookId, await nextBarcode(tx), 'good']
+      );
+
+      return tx.queryOne(BOOK_BY_ID, [bookId]);
+    });
+
+    // 201 means "created", and it is what tells the frontend to navigate to
+    // the new book rather than just showing a success message.
+    res.status(201).json(book);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ===========================================================================
+ *  PUT /api/books/:id  —  edit a title
+ * ===========================================================================
+ *
+ * No transaction: this is a single UPDATE. Copies are untouched -- correcting
+ * a typo in the author should not disturb the physical stock.
+ */
+router.put('/:id', async (req, res, next) => {
+  try {
+    const id = readId(req.params.id, 'book');
+    validateBook(req.body);
+
+    const changed = await execute(
+      `UPDATE books
+       SET isbn = ?, title = ?, author = ?, publisher = ?, year = ?,
+           dewey = ?, category = ?, shelf = ?, description = ?
+       WHERE id = ?`,
+      [
+        clean(req.body.isbn),
+        clean(req.body.title),
+        clean(req.body.author),
+        clean(req.body.publisher),
+        req.body.year ? Number(req.body.year) : null,
+        clean(req.body.dewey),
+        clean(req.body.category),
+        clean(req.body.shelf),
+        clean(req.body.description),
+        id,
+      ]
+    );
+
+    /**
+     * affectedRows is 0 both when the id does not exist AND when the values
+     * submitted are identical to what is already stored. Checking the row
+     * exists separately keeps a no-op save from looking like a 404.
+     */
+    if (changed === 0) {
+      const exists = await queryOne('SELECT id FROM books WHERE id = ?', [id]);
+      if (!exists) throw new HttpError(404, 'No book with that id.');
+    }
+
+    res.json(await queryOne(BOOK_BY_ID, [id]));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ===========================================================================
+ *  DELETE /api/books/:id  —  remove a title
+ * ===========================================================================
+ *
+ * Refused while any copy is on loan. Deleting would cascade the copies away
+ * and leave loan rows pointing at nothing, so the borrower's record would
+ * silently lose the book they are holding.
+ */
+router.delete('/:id', async (req, res, next) => {
+  try {
+    const id = readId(req.params.id, 'book');
+
+    const book = await queryOne('SELECT id, title FROM books WHERE id = ?', [id]);
+    if (!book) throw new HttpError(404, 'No book with that id.');
+
+    const out = await queryOne(
+      `SELECT COUNT(*) AS n
+       FROM copies WHERE book_id = ? AND status = 'on_loan'`,
+      [id]
+    );
+
+    // 409 Conflict: the request is well formed, but the current state of the
+    // data forbids it. Saying how many are out tells the librarian what to do.
+    if (out.n > 0) {
+      throw new HttpError(
+        409,
+        `${out.n} ${out.n === 1 ? 'copy is' : 'copies are'} still on loan. Every copy has to come back before this title can be removed.`
+      );
+    }
+
+    // `copies` has ON DELETE CASCADE, so the copies go with the book.
+    await execute('DELETE FROM books WHERE id = ?', [id]);
+
+    // 204 No Content: it worked, and there is nothing to send back.
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ===========================================================================
+ *  POST /api/books/:id/copies  —  add another physical copy
+ * ========================================================================= */
+router.post('/:id/copies', async (req, res, next) => {
+  try {
+    const id = readId(req.params.id, 'book');
+
+    const book = await queryOne('SELECT id FROM books WHERE id = ?', [id]);
+    if (!book) throw new HttpError(404, 'No book with that id.');
+
+    const copy = await transaction(async (tx) => {
+      // A blank barcode means "assign the next one" -- the common case when a
+      // librarian is adding a copy that has not been labelled yet.
+      const barcode = clean(req.body.barcode) ?? (await nextBarcode(tx));
+
+      const copyId = await tx.insert(
+        'INSERT INTO copies (book_id, barcode, `condition`) VALUES (?, ?, ?)',
+        [id, barcode, clean(req.body.condition) ?? 'good']
+      );
+
+      return tx.queryOne(
+        'SELECT id, barcode, status, `condition`, acquired_at AS acquiredAt FROM copies WHERE id = ?',
+        [copyId]
+      );
+    });
+
+    res.status(201).json(copy);
   } catch (err) {
     next(err);
   }

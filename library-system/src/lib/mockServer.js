@@ -14,13 +14,17 @@
  */
 export const LIVE_ENDPOINTS = [
   // 'POST /api/auth/login',
-  'GET /api/books',
-  'GET /api/books/:id',
-  'GET /api/members',
-  'GET /api/members/:id',
-  'GET /api/loans',
-  'GET /api/fines',
-  'GET /api/settings',
+      'GET /api/books',
+      'POST /api/books',
+      'PUT /api/books/:id',
+      'DELETE /api/books/:id',      
+      'GET /api/books/:id',    
+      'POST /api/books/:id/copies',
+      'GET /api/members',    
+      'GET /api/members/:id',
+    'GET /api/loans',      
+    'GET /api/settings', 
+    'GET /api/fines',  
 ];
 
 /**

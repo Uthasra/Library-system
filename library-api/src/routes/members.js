@@ -1,32 +1,62 @@
 import { Router } from 'express';
-import { query, queryOne } from '../db.js';
+import { execute, query, queryOne, transaction } from '../db.js';
+import { HttpError, check, clean, emailRule, oneOf, readId, required } from '../validate.js';
+import { shapeLoan, shapeFine } from '../shape.js';
 
 const router = Router();
 
 const PAGE_SIZE = 12;
 
+const MEMBERSHIP_TYPES = ['standard', 'student', 'senior'];
+const STATUSES = ['active', 'suspended', 'expired'];
+
 /**
- * Turns a raw loan row into the shape the frontend expects, including the two
- * values that are CALCULATED rather than stored: `status` and `daysLate`.
- *
- * A loan is returned if it has a return date, overdue if its due date has
- * passed, and active otherwise. Storing that in a column would be wrong every
- * night at midnight, when yesterday's due books quietly become overdue.
+ * One member with the two aggregates. Create, update and the detail endpoint
+ * all return this same shape, so the form shows the same numbers after saving
+ * that it showed before.
  */
-function shapeLoan(row) {
-  const overdue = !row.returnedAt && new Date(row.dueAt) < new Date();
-  return {
-    id: row.id,
-    issuedAt: row.issuedAt,
-    dueAt: row.dueAt,
-    returnedAt: row.returnedAt,
-    renewals: row.renewals,
-    barcode: row.barcode,
-    status: row.returnedAt ? 'returned' : overdue ? 'overdue' : 'active',
-    daysLate: overdue ? Math.floor((Date.now() - new Date(row.dueAt)) / 86400000) : 0,
-    book: { id: row.bookId, title: row.bookTitle, author: row.bookAuthor, dewey: row.bookDewey },
-    member: { id: row.memberId, name: row.memberName, memberNo: row.memberNo },
-  };
+const MEMBER_BY_ID = `
+  SELECT
+    m.id,
+    m.member_no       AS memberNo,
+    m.name, m.email, m.phone, m.address,
+    m.membership_type AS membershipType,
+    m.status,
+    m.joined_at       AS joinedAt,
+    m.expires_at      AS expiresAt,
+    (SELECT COUNT(*) FROM loans l
+      WHERE l.member_id = m.id AND l.returned_at IS NULL) AS activeLoans,
+    (SELECT COALESCE(SUM(f.amount), 0) FROM fines f
+      WHERE f.member_id = m.id AND f.status = 'unpaid') AS unpaidFines
+  FROM members m
+  WHERE m.id = ?
+`;
+
+function validateMember(body, { isNew }) {
+  check({
+    name: required(body.name, 'Name'),
+    email: emailRule(body.email),
+    membershipType: oneOf(body.membershipType, MEMBERSHIP_TYPES, 'Membership type'),
+    // Status is chosen by staff on an existing record; a new member is always
+    // active, so the field is not accepted on create.
+    status: isNew ? null : oneOf(body.status, STATUSES, 'Status'),
+  });
+}
+
+/**
+ * The next member number, e.g. M-1026.
+ *
+ * The server assigns this, never the client. A number that has to be unique
+ * cannot be trusted to the browser: two people registering at once would both
+ * send M-1026 and one insert would fail. Reading MAX inside the transaction
+ * keeps the two steps together.
+ */
+async function nextMemberNo(tx) {
+  const row = await tx.queryOne(
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(member_no, 3) AS UNSIGNED)), 1000) + 1 AS next
+     FROM members WHERE member_no REGEXP '^M-[0-9]+$'`
+  );
+  return `M-${row.next}`;
 }
 
 /* ===========================================================================
@@ -167,10 +197,15 @@ router.get('/:id', async (req, res, next) => {
          f.reason, f.status,
          f.created_at AS createdAt,
          f.paid_at    AS paidAt,
-         f.loan_id    AS loanId,
+         f.loan_id       AS loanId,
+         f.waived_reason AS waivedReason,
          b.id    AS bookId,
-         b.title AS bookTitle
+         b.title AS bookTitle,
+         m.id        AS memberId,
+         m.name      AS memberName,
+         m.member_no AS memberNo
        FROM fines f
+       JOIN members m ON m.id = f.member_id
        JOIN loans l  ON l.id = f.loan_id
        JOIN copies c ON c.id = l.copy_id
        JOIN books b  ON b.id = c.book_id
@@ -180,20 +215,86 @@ router.get('/:id', async (req, res, next) => {
     );
 
     member.loans = loanRows.map(shapeLoan);
-    member.fines = fines.map((f) => ({
-      id: f.id,
-      amount: f.amount,
-      daysLate: f.daysLate,
-      reason: f.reason,
-      status: f.status,
-      createdAt: f.createdAt,
-      paidAt: f.paidAt,
-      loanId: f.loanId,
-      book: { id: f.bookId, title: f.bookTitle },
-      member: { id: member.id, name: member.name, memberNo: member.memberNo },
-    }));
+    member.fines = fines.map(shapeFine);
 
     res.json(member);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ===========================================================================
+ *  POST /api/members     —  register someone new
+ * ===========================================================================
+ *
+ * The client sends name, email, phone, address and membership type. Everything
+ * else is decided here: the member number, the joining date, the expiry a year
+ * out, and the active status. Those are library policy, not user input.
+ */
+router.post('/', async (req, res, next) => {
+  try {
+    validateMember(req.body, { isNew: true });
+
+    const member = await transaction(async (tx) => {
+      const memberNo = await nextMemberNo(tx);
+
+      const id = await tx.insert(
+        `INSERT INTO members
+           (member_no, name, email, phone, address, membership_type, status, joined_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', NOW(), DATE_ADD(NOW(), INTERVAL 1 YEAR))`,
+        [
+          memberNo,
+          clean(req.body.name),
+          clean(req.body.email),
+          clean(req.body.phone),
+          clean(req.body.address),
+          clean(req.body.membershipType) ?? 'standard',
+        ]
+      );
+
+      return tx.queryOne(MEMBER_BY_ID, [id]);
+    });
+
+    res.status(201).json(member);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ===========================================================================
+ *  PUT /api/members/:id  —  edit a member
+ * ===========================================================================
+ *
+ * `member_no` and `joined_at` are deliberately not in the UPDATE. A member
+ * number appears on a printed card and in every past loan record; letting it
+ * change would break the paper trail. Staff CAN change status here, which is
+ * how a card gets suspended or reinstated.
+ */
+router.put('/:id', async (req, res, next) => {
+  try {
+    const id = readId(req.params.id, 'member');
+    validateMember(req.body, { isNew: false });
+
+    const existing = await queryOne('SELECT id FROM members WHERE id = ?', [id]);
+    if (!existing) throw new HttpError(404, 'No member with that id.');
+
+    await execute(
+      `UPDATE members
+       SET name = ?, email = ?, phone = ?, address = ?,
+           membership_type = ?, status = ?
+       WHERE id = ?`,
+      [
+        clean(req.body.name),
+        clean(req.body.email),
+        clean(req.body.phone),
+        clean(req.body.address),
+        clean(req.body.membershipType) ?? 'standard',
+        clean(req.body.status) ?? 'active',
+        id,
+      ]
+    );
+
+    res.json(await queryOne(MEMBER_BY_ID, [id]));
   } catch (err) {
     next(err);
   }
